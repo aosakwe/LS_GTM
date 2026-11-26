@@ -1,0 +1,682 @@
+---
+title: "CTS_Deconvolution"
+author: "Adrien Osakwe"
+format: html
+editor: visual
+---
+
+## Load Library
+
+```{r,message = F, warning=F}
+set.seed(1234)
+library(scran)
+library(scuttle)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(Matrix)
+library(SpaTM)
+library(DESeq2)
+decon_df <- readRDS("./Manuscript/DESeq2/LS_decon.rds")
+```
+
+```{r}
+rm_samples <- '/home/adrien/Desktop/LS_GTM/meta/remove_samples.txt'
+meta_df <- '/home/adrien/Desktop/LS_GTM/meta/patient_meta.csv'
+ls_meta <- '/home/adrien/Desktop/LS_GTM/meta/LS_Meta.csv'
+
+meta_df <- read.csv(meta_df,header = T,na.strings = "N/A")
+rownames(meta_df) <- meta_df$Patient
+ls_meta <- read.csv(ls_meta, header = T,na.strings = "N/A")
+
+rm_samples <- colnames(read.csv(rm_samples))
+meta_df <- meta_df[!rownames(meta_df) %in% rm_samples,]
+meta_df$Cond <- NA
+meta_df$Cond[str_detect(rownames(meta_df),"CSU")] <- 'CSU'
+meta_df$Cond[str_detect(rownames(meta_df),"LS")] <- 'LS'
+meta_df$Cond[str_detect(rownames(meta_df),"N")] <- 'CTRL'
+meta_df$Cond[str_detect(rownames(meta_df),"CTRL")] <- 'CTRL'
+rownames(meta_df) <- str_replace(rownames(meta_df),"\\.","-")
+
+meta_df$GCL <- NA
+meta_df$GCL[match(ls_meta$Sample.Name,rownames(meta_df))] <- ls_meta$Subtype..HC..Generalized..Circumscribed..Linear.
+meta_df$GCL[meta_df$Cond == 'CTRL'] <- 'Healthy'
+meta_df$Activity <- NA
+meta_df$Activity[match(ls_meta$Sample.Name,rownames(meta_df))] <- ls_meta$Activity..Healthy..Inactive..Active.
+meta_df$Activity[meta_df$Cond == 'CTRL'] <- 'Healthy'
+meta_df$Group <- NA
+meta_df$Group[match(ls_meta$Sample.Name,rownames(meta_df))] <- ls_meta$Group..Fibrotic.Inflammatory.
+meta_df$Group[meta_df$Cond == 'CTRL'] <- 'Healthy'
+meta_df$Cond[meta_df$Cond == 'CTRL'] <- 'Healthy'
+
+
+meta_df <- meta_df[meta_df$Cond != 'CSU',]
+
+meta_df <- meta_df %>%
+  dplyr::select(-Patient)
+
+table(rownames(decon_df) == rownames(meta_df))
+colnames(decon_df) <- str_replace_all(colnames(decon_df),'\\-','_')
+colnames(decon_df) <- str_replace_all(colnames(decon_df),' ','_')
+
+meta_df <- cbind(meta_df,as.data.frame(decon_df))
+#Summarized Experiment
+bulk_counts <- read.csv("./Data/final_counts.csv")
+rownames(bulk_counts) <- bulk_counts[,1]
+bulk_counts <- bulk_counts[,-1]
+
+colnames(bulk_counts) <- str_replace(colnames(bulk_counts),'\\.','-')
+bulk_counts <- bulk_counts[,rownames(meta_df)]
+```
+
+```{r}
+meta_df$Batch <- 'Netchiporouk'
+meta_df$Batch[str_detect(rownames(meta_df),'N')] <- 'LeFrancois2'
+meta_df$Batch[rownames(meta_df) %in% c('N4','N5','N6','N9')] <- 'LeFrancois1'
+```
+
+```{r}
+se <- SummarizedExperiment(assays = list(counts = bulk_counts),
+                           colData = as(meta_df,'DataFrame'))
+
+se <- se[!is.na(rownames(se)),]
+se <- se[,se$Cond != 'CSU']
+se$Group[is.na(se$Group)] <- 'Unknown'
+#se <- se[,se$Group %in% c('Healthy','Inflammatory')]
+se$Cond <- factor(se$Cond, levels = c('Healthy','LS'))
+bulk.dge <- read.csv("./Manuscript/DESeq2/LS_Unfiltered.csv")
+
+rownames(bulk.dge) <- bulk.dge$Gene
+bulk.dge$GoI <- abs(bulk.dge$logFC) >= 1 & bulk.dge$adj.P.Val < 0.05
+```
+
+```{r}
+
+cts_gex <- readRDS("./Manuscript/DESeq2/final_gex.rds")
+
+cts_gex_samples <- colnames(cts_gex)
+split_info <- strsplit(cts_gex_samples, "_")  # Split by the underscore
+sample_names <- sapply(split_info, `[`, 1)   # Extract sample names
+cell_types <- sapply(split_info, `[`, 2)     # Extract cell types
+
+
+alt_meta_df <- data.frame(
+  Sample = sample_names,
+  Celltype = cell_types,
+  row.names = cts_gex_samples
+)
+
+# Filter alt_meta_df to include only samples that match rownames of meta_df
+filtered_alt_meta_df <- alt_meta_df[alt_meta_df$Sample %in% rownames(meta_df), ]
+
+# Add metadata from meta_df to the filtered_alt_meta_df
+filtered_alt_meta_df <- cbind(
+  filtered_alt_meta_df,
+  meta_df[filtered_alt_meta_df$Sample, ]
+)
+
+filtered_alt_meta_df <- filtered_alt_meta_df#[,!colnames(filtered_alt_meta_df) %in% cell_names]
+
+se <- SummarizedExperiment(assays = list(counts = as.matrix(cts_gex)),
+                           colData = as(filtered_alt_meta_df,'DataFrame'))
+```
+
+```{r,message=FALSE,warning=FALSE}
+
+dge_res <- list()
+full_res <- list()
+assay(se,'counts') <- round(assay(se,'counts'))
+print(unique(se$Celltype))
+print(colnames(decon_df))
+dds_all <- list()
+for (cell in unique(se$Celltype)[apply(decon_df,2,median) > 1e-2]){
+  cur_se <- se[,se$Celltype == cell]
+  
+  cur_se <- cur_se[,colSums(assay(cur_se,'counts')) > 0]
+
+  cell_name <- str_replace_all(cell," ","_")
+  cell_name <- str_replace(cell_name,"-","_")
+  design <- reformulate(c('Cond',"Batch",cell_name))
+  
+  cur_dds <- DESeqDataSet(se = cur_se,
+                          design = design)
+  cur_dds <- DESeq(cur_dds,
+                   sfType = "poscounts",
+                   parallel = T,
+                   quiet = T)
+  dds_all[[cell]] <- cur_dds
+  res.out <- lfcShrink(cur_dds, coef = "Cond_LS_vs_Healthy", type = "apeglm",quiet = TRUE)
+  #res.out <- results(cur_dds,contrast = c('Cond','LS','Healthy'))
+  res.out <- na.omit(res.out)
+  full_res[[cell]] <- res.out
+  full_res[[cell]]$Gene <- rownames(res.out)
+  full_res[[cell]]$Celltype <- cell
+  res.out <- res.out[abs(res.out$log2FoldChange) >= 1 & res.out$padj < 0.05,]
+  if(nrow(res.out) < 1){
+    next
+  }
+  
+  res.out$Gene <- rownames(res.out)
+  res.out$Celltype <- cell
+  res.out$Total_Samples <- ncol(cur_se)
+  dge_res[[cell]] <- res.out
+}
+
+dge_res <- lapply(dge_res,as.data.frame)
+dge_res <- do.call('rbind',dge_res)
+rownames(dge_res) <- NULL
+dge_res$Overlap <- dge_res$Gene %in% bulk.dge$Gene[bulk.dge$GoI]
+table(dge_res$Overlap)
+length(unique(dge_res$Gene))
+full_res <- lapply(full_res,as.data.frame)
+full_res <- do.call('rbind',full_res)
+full_res <- full_res %>%
+  dplyr::mutate(Overlap = ifelse(abs(log2FoldChange) >= 1 & padj < 0.05,
+                                 Gene %in% bulk.dge$Gene[bulk.dge$GoI],
+                                 FALSE))
+rownames(full_res) <- NULL
+
+
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+
+# Map gene symbols to descriptions
+
+# Map Ensembl IDs to gene symbols
+dge_res$Symbol <- mapIds(
+  org.Hs.eg.db,
+  keys = dge_res$Gene,       # Use the Ensembl IDs from rownames of dge_res
+  column = "SYMBOL",              # Retrieve gene symbols
+  keytype = "ENSEMBL",            # Match based on Ensembl IDs
+  multiVals = "first"             # Use the first match if multiple exist
+)
+
+# Map Ensembl IDs to gene descriptions
+dge_res$Description <- mapIds(
+  org.Hs.eg.db,
+  keys = dge_res$Gene,       # Use the Ensembl IDs from rownames of dge_res
+  column = "GENENAME",            # Retrieve gene descriptions
+  keytype = "ENSEMBL",            # Match based on Ensembl IDs
+  multiVals = "first"             # Use the first match if multiple exist
+)
+
+
+full_res$Symbol <- mapIds(
+  org.Hs.eg.db,
+  keys = full_res$Gene,       # Use the Ensembl IDs from rownames of dge_res
+  column = "SYMBOL",              # Retrieve gene symbols
+  keytype = "ENSEMBL",            # Match based on Ensembl IDs
+  multiVals = "first"             # Use the first match if multiple exist
+)
+
+# Map Ensembl IDs to gene descriptions
+full_res$Description <- mapIds(
+  org.Hs.eg.db,
+  keys = full_res$Gene,       # Use the Ensembl IDs from rownames of dge_res
+  column = "GENENAME",            # Retrieve gene descriptions
+  keytype = "ENSEMBL",            # Match based on Ensembl IDs
+  multiVals = "first"             # Use the first match if multiple exist
+)
+View(dge_res)
+```
+
+```{r}
+
+for (cell in unique(full_res$Celltype)){
+  
+  p <- full_res %>%
+            dplyr::filter(Celltype == cell) %>%
+            dplyr::mutate(GoI = abs(log2FoldChange) >= 1 & padj < 0.05) %>%
+            dplyr::mutate(pvalue = ifelse(pvalue < 1e-10,1e-10,pvalue)) %>%
+            ggplot(aes(log2FoldChange,-log10(pvalue),color = GoI, shape = Overlap)) +
+            geom_point() + 
+            labs(title = cell) +
+            geom_text(
+              data = . %>% dplyr::filter(GoI),  # Only label genes of interest
+              aes(label = Symbol),             # Use the gene symbol as the label
+              vjust = -0.5,                    # Adjust vertical position of text
+              size = 3                         # Adjust text size
+            )
+  print(p)
+}
+```
+
+```{r}
+library(EnhancedVolcano)
+ehan <- list()
+for (cell in unique(dge_res$Celltype)){
+    
+  cur_res <- full_res %>%
+              dplyr::filter(Celltype == cell) %>%
+              dplyr::mutate(GoI = abs(log2FoldChange) >= 1 & padj < 0.01) %>%
+              dplyr::arrange(desc(GoI),desc(abs(log2FoldChange))) %>%
+              dplyr::mutate(pvalue = ifelse(pvalue < 1e-10,1e-10,pvalue))
+  
+
+  shape_keys <- ifelse(cur_res$Overlap,17,16)
+  names(shape_keys) <- ifelse(shape_keys == 17,'Bulk DEG','Novel DEG')
+  ehan[[cell]] <- EnhancedVolcano(cur_res,
+                  lab = cur_res$Symbol,
+                  selectLab = cur_res$Symbol[cur_res$GoI],
+                  drawConnectors = TRUE,
+                  x = 'log2FoldChange',
+                  y = 'pvalue',
+                  legendPosition = 'none',
+                  ylim = c(0,10),
+                  shapeCustom = shape_keys,
+                  xlim = c(min(cur_res$log2FoldChange)-0.1,
+                           max(cur_res$log2FoldChange))+0.1,
+                  pCutoff = 1e-3,
+                  title = str_to_title(cell),
+                  subtitle = '')
+
+}
+
+
+lapply(names(ehan),function(a){
+  print(ehan[[a]])
+  ggsave(paste(a,"dge.pdf",sep = ''),device = 'pdf',
+         width = 10,height = 8)
+})
+```
+
+## Senesence Hits
+
+```{r}
+gene_sig <- read.csv("./Manuscript/senesence.csv",header = F)[,1]
+
+sen_dge <- dge_res %>%
+  dplyr::filter(Symbol %in% gene_sig)
+
+sen_cels <- unique(sen_dge$Celltype)
+
+
+```
+
+```{r}
+
+# Get the unique cell types from the senescence results
+sen_cels <- unique(sen_dge$Celltype)
+
+# Prepare an empty list for ggplot objects
+senescence_plots <- list()
+
+# Loop over each cell type and each gene in that cell type
+for(cell in sen_cels){
+  genes_in_cell <- sen_dge %>% 
+    filter(Celltype == cell) %>% 
+    distinct(Gene, Symbol)
+  
+  for(i in 1:nrow(genes_in_cell)){
+    cur_gene <- genes_in_cell$Gene[i]
+    cur_symbol <- genes_in_cell$Symbol[i]
+    
+    # Map the gene symbol to an Ensembl ID (if needed)
+    cur_ID <- mapIds(org.Hs.eg.db,
+                     keys = cur_symbol,
+                     column = "ENSEMBL",
+                     keytype = "SYMBOL",
+                     multiVals = "first")
+    
+    # Retrieve count data using plotCounts from the DESeq2 object for the current cell type
+    pdat <- plotCounts(dds_all[[cell]], gene = cur_ID, intgroup = "Cond", 
+                       transform = TRUE, returnData = TRUE)
+    
+    # Retrieve the adjusted p-value from sen_dge for the current gene and cell type
+    adj_p <- sen_dge %>% 
+             filter(Celltype == cell, Gene == cur_gene) %>% 
+             pull(padj)
+    if(length(adj_p) == 0) {
+      adj_p <- NA
+    } else {
+      adj_p <- adj_p[1]
+    }
+    
+    # Define annotation data for Healthy vs LS comparison
+    # Set the y.position slightly above the maximum count value
+    y_pos <- log10(max(pdat$count, na.rm = TRUE)) * 1.1
+    anno_df <- data.frame(
+      group1 = "Healthy",
+      group2 = "LS",
+      p.adj = adj_p,
+      y.position = y_pos
+    )
+    # Create a custom label displaying the adjusted p-value
+    anno_df$label <- paste0("p.adj = ", format(anno_df$p.adj, digits = 2))
+    
+    # Create a ggpubr box plot with jitter and log-scaled y axis;
+    # annotate the plot with the pre-computed adjusted p-value.
+    pdat$count <- log10(pdat$count)
+    p_obj <- ggboxplot(pdat, x = "Cond", y = "count", fill = "Cond",
+                       add = "jitter", palette = c("#00AFBB",'#E63946')) +
+      #scale_y_log10() +
+      stat_pvalue_manual(anno_df,
+                         label = "label",
+                         xmin = "group1",
+                         xmax = "group2",
+                         y.position = "y.position",
+                         tip.length = 0.01,
+                         bracket.size = 0.5,
+                         step.increase = 0.2,
+                         size = 6) +
+      labs(title = paste(str_to_title(cell), "-", cur_symbol),
+           x = "Condition",
+           y = "Norm. Expression (Log10)") +
+      theme_minimal(base_size = 16) +
+      theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+            axis.line.y = element_line(colour = 'black'),
+            axis.line.x = element_line(colour = 'black'))
+    
+    # Store the plot in the list with a combined key
+    plot_key <- paste(cell, cur_symbol, sep = "_")
+    senescence_plots[[plot_key]] <- p_obj
+  }
+}
+
+```
+
+### Group
+
+```{r}
+
+dge_res <- list()
+full_res <- list()
+assay(se,'counts') <- round(assay(se,'counts'))
+print(unique(se$Celltype))
+print(colnames(decon_df))
+dds_all <- list()
+for (cell in unique(se$Celltype)[apply(decon_df,2,median) > 1e-2]){
+  cur_se <- se[,se$Celltype == cell]
+  
+  cur_se <- cur_se[,colSums(assay(cur_se,'counts')) > 0]
+  cur_se <- cur_se[,cur_se$Group %in% c('Healthy','Inflammatory','Fibrotic')]
+  cur_se$Group <- factor(cur_se$Group,levels = c('Healthy','Inflammatory','Fibrotic'))
+  cell_name <- str_replace_all(cell," ","_")
+  cell_name <- str_replace(cell_name,"-","_")
+  design <- reformulate(c("Group",cell_name)) #'Batch',
+  
+  cur_dds <- DESeqDataSet(se = cur_se,
+                          design = design)
+  cur_dds <- DESeq(cur_dds,
+                   sfType = "poscounts",
+                   parallel = T,
+                   quiet = T)
+  dds_all[[cell]] <- cur_dds
+  res.out <- lfcShrink(cur_dds,coef = "Group_Fibrotic_vs_Inflammatory", type = "apeglm",quiet = TRUE)
+  #res.out <- results(cur_dds,contrast = c('Cond','LS','Healthy'))
+  res.out <- na.omit(res.out)
+  full_res[[cell]] <- res.out
+  full_res[[cell]]$Gene <- rownames(res.out)
+  full_res[[cell]]$Celltype <- cell
+  res.out <- res.out[abs(res.out$log2FoldChange) >= 1 & res.out$padj < 0.05,]
+  if(nrow(res.out) < 1){
+    next
+  }
+  
+  res.out$Gene <- rownames(res.out)
+  res.out$Celltype <- cell
+  res.out$Total_Samples <- ncol(cur_se)
+  dge_res[[cell]] <- res.out
+}
+
+dge_res <- lapply(dge_res,as.data.frame)
+dge_res <- do.call('rbind',dge_res)
+rownames(dge_res) <- NULL
+dge_res$Overlap <- dge_res$Gene %in% bulk.dge$Gene[bulk.dge$GoI]
+table(dge_res$Overlap)
+length(unique(dge_res$Gene))
+full_res <- lapply(full_res,as.data.frame)
+full_res <- do.call('rbind',full_res)
+full_res <- full_res %>%
+  dplyr::mutate(Overlap = ifelse(abs(log2FoldChange) >= 1 & padj < 0.05,
+                                 Gene %in% bulk.dge$Gene[bulk.dge$GoI],
+                                 FALSE))
+rownames(full_res) <- NULL
+
+
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+
+# Map gene symbols to descriptions
+
+# Map Ensembl IDs to gene symbols
+dge_res$Symbol <- mapIds(
+  org.Hs.eg.db,
+  keys = dge_res$Gene,       # Use the Ensembl IDs from rownames of dge_res
+  column = "SYMBOL",              # Retrieve gene symbols
+  keytype = "ENSEMBL",            # Match based on Ensembl IDs
+  multiVals = "first"             # Use the first match if multiple exist
+)
+
+# Map Ensembl IDs to gene descriptions
+dge_res$Description <- mapIds(
+  org.Hs.eg.db,
+  keys = dge_res$Gene,       # Use the Ensembl IDs from rownames of dge_res
+  column = "GENENAME",            # Retrieve gene descriptions
+  keytype = "ENSEMBL",            # Match based on Ensembl IDs
+  multiVals = "first"             # Use the first match if multiple exist
+)
+
+
+full_res$Symbol <- mapIds(
+  org.Hs.eg.db,
+  keys = full_res$Gene,       # Use the Ensembl IDs from rownames of dge_res
+  column = "SYMBOL",              # Retrieve gene symbols
+  keytype = "ENSEMBL",            # Match based on Ensembl IDs
+  multiVals = "first"             # Use the first match if multiple exist
+)
+
+# Map Ensembl IDs to gene descriptions
+full_res$Description <- mapIds(
+  org.Hs.eg.db,
+  keys = full_res$Gene,       # Use the Ensembl IDs from rownames of dge_res
+  column = "GENENAME",            # Retrieve gene descriptions
+  keytype = "ENSEMBL",            # Match based on Ensembl IDs
+  multiVals = "first"             # Use the first match if multiple exist
+)
+View(dge_res)
+```
+
+### Activity
+
+```{r}
+
+dge_res <- list()
+full_res <- list()
+assay(se,'counts') <- round(assay(se,'counts'))
+print(unique(se$Celltype))
+print(colnames(decon_df))
+dds_all <- list()
+for (cell in unique(se$Celltype)[apply(decon_df,2,median) > 1e-2]){
+  cur_se <- se[,se$Celltype == cell]
+  
+  cur_se <- cur_se[,colSums(assay(cur_se,'counts')) > 0]
+  cur_se <- cur_se[,cur_se$Activity %in% c('Healthy','Active')]
+  cur_se$Activity <- factor(cur_se$Activity,c('Healthy','Active'))
+  cell_name <- str_replace_all(cell," ","_")
+  cell_name <- str_replace(cell_name,"-","_")
+  design <- reformulate(c("Activity",'Batch',cell_name)) #'Batch',
+  
+  cur_dds <- DESeqDataSet(se = cur_se,
+                          design = design)
+  cur_dds <- DESeq(cur_dds,
+                   sfType = "poscounts",
+                   parallel = T,
+                   quiet = T)
+  dds_all[[cell]] <- cur_dds
+  res.out <- lfcShrink(cur_dds, coef = "Activity_Active_vs_Healthy", type = "apeglm",quiet = TRUE)
+  #res.out <- results(cur_dds,contrast = c('Cond','LS','Healthy'))
+  res.out <- na.omit(res.out)
+  full_res[[cell]] <- res.out
+  full_res[[cell]]$Gene <- rownames(res.out)
+  full_res[[cell]]$Celltype <- cell
+  res.out <- res.out[abs(res.out$log2FoldChange) >= 1 & res.out$padj < 0.05,]
+  if(nrow(res.out) < 1){
+    next
+  }
+  
+  res.out$Gene <- rownames(res.out)
+  res.out$Celltype <- cell
+  res.out$Total_Samples <- ncol(cur_se)
+  dge_res[[cell]] <- res.out
+}
+
+dge_res <- lapply(dge_res,as.data.frame)
+dge_res <- do.call('rbind',dge_res)
+rownames(dge_res) <- NULL
+dge_res$Overlap <- dge_res$Gene %in% bulk.dge$Gene[bulk.dge$GoI]
+table(dge_res$Overlap)
+length(unique(dge_res$Gene))
+full_res <- lapply(full_res,as.data.frame)
+full_res <- do.call('rbind',full_res)
+full_res <- full_res %>%
+  dplyr::mutate(Overlap = ifelse(abs(log2FoldChange) >= 1 & padj < 0.05,
+                                 Gene %in% bulk.dge$Gene[bulk.dge$GoI],
+                                 FALSE))
+rownames(full_res) <- NULL
+
+
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+
+# Map gene symbols to descriptions
+
+# Map Ensembl IDs to gene symbols
+dge_res$Symbol <- mapIds(
+  org.Hs.eg.db,
+  keys = dge_res$Gene,       # Use the Ensembl IDs from rownames of dge_res
+  column = "SYMBOL",              # Retrieve gene symbols
+  keytype = "ENSEMBL",            # Match based on Ensembl IDs
+  multiVals = "first"             # Use the first match if multiple exist
+)
+
+# Map Ensembl IDs to gene descriptions
+dge_res$Description <- mapIds(
+  org.Hs.eg.db,
+  keys = dge_res$Gene,       # Use the Ensembl IDs from rownames of dge_res
+  column = "GENENAME",            # Retrieve gene descriptions
+  keytype = "ENSEMBL",            # Match based on Ensembl IDs
+  multiVals = "first"             # Use the first match if multiple exist
+)
+
+
+full_res$Symbol <- mapIds(
+  org.Hs.eg.db,
+  keys = full_res$Gene,       # Use the Ensembl IDs from rownames of dge_res
+  column = "SYMBOL",              # Retrieve gene symbols
+  keytype = "ENSEMBL",            # Match based on Ensembl IDs
+  multiVals = "first"             # Use the first match if multiple exist
+)
+
+# Map Ensembl IDs to gene descriptions
+full_res$Description <- mapIds(
+  org.Hs.eg.db,
+  keys = full_res$Gene,       # Use the Ensembl IDs from rownames of dge_res
+  column = "GENENAME",            # Retrieve gene descriptions
+  keytype = "ENSEMBL",            # Match based on Ensembl IDs
+  multiVals = "first"             # Use the first match if multiple exist
+)
+View(dge_res)
+```
+
+### GCL
+
+```{r}
+
+dge_res <- list()
+full_res <- list()
+assay(se,'counts') <- round(assay(se,'counts'))
+print(unique(se$Celltype))
+print(colnames(decon_df))
+dds_all <- list()
+for (cell in unique(se$Celltype)[apply(decon_df,2,median) > 1e-2]){
+  cur_se <- se[,se$Celltype == cell]
+  
+  cur_se <- cur_se[,colSums(assay(cur_se,'counts')) > 0]
+  cur_se <- cur_se[,cur_se$GCL %in% c('Healthy','Generalized','Circumscribed')]
+
+  cell_name <- str_replace_all(cell," ","_")
+  cell_name <- str_replace(cell_name,"-","_")
+  design <- reformulate(c("GCL",'Batch',cell_name)) #'Batch',
+  
+  cur_dds <- DESeqDataSet(se = cur_se,
+                          design = design)
+  cur_dds <- DESeq(cur_dds,
+                   sfType = "poscounts",
+                   parallel = T,
+                   quiet = T)
+  dds_all[[cell]] <- cur_dds
+  res.out <- lfcShrink(cur_dds, coef = "GCL_Generalized_vs_Healthy", type = "apeglm",quiet = TRUE)
+  #res.out <- results(cur_dds,contrast = c('Cond','LS','Healthy'))
+  res.out <- na.omit(res.out)
+  full_res[[cell]] <- res.out
+  full_res[[cell]]$Gene <- rownames(res.out)
+  full_res[[cell]]$Celltype <- cell
+  res.out <- res.out[abs(res.out$log2FoldChange) >= 1 & res.out$padj < 0.05,]
+  if(nrow(res.out) < 1){
+    next
+  }
+  
+  res.out$Gene <- rownames(res.out)
+  res.out$Celltype <- cell
+  res.out$Total_Samples <- ncol(cur_se)
+  dge_res[[cell]] <- res.out
+}
+
+dge_res <- lapply(dge_res,as.data.frame)
+dge_res <- do.call('rbind',dge_res)
+rownames(dge_res) <- NULL
+dge_res$Overlap <- dge_res$Gene %in% bulk.dge$Gene[bulk.dge$GoI]
+table(dge_res$Overlap)
+length(unique(dge_res$Gene))
+full_res <- lapply(full_res,as.data.frame)
+full_res <- do.call('rbind',full_res)
+full_res <- full_res %>%
+  dplyr::mutate(Overlap = ifelse(abs(log2FoldChange) >= 1 & padj < 0.05,
+                                 Gene %in% bulk.dge$Gene[bulk.dge$GoI],
+                                 FALSE))
+rownames(full_res) <- NULL
+
+
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+
+# Map gene symbols to descriptions
+
+# Map Ensembl IDs to gene symbols
+dge_res$Symbol <- mapIds(
+  org.Hs.eg.db,
+  keys = dge_res$Gene,       # Use the Ensembl IDs from rownames of dge_res
+  column = "SYMBOL",              # Retrieve gene symbols
+  keytype = "ENSEMBL",            # Match based on Ensembl IDs
+  multiVals = "first"             # Use the first match if multiple exist
+)
+
+# Map Ensembl IDs to gene descriptions
+dge_res$Description <- mapIds(
+  org.Hs.eg.db,
+  keys = dge_res$Gene,       # Use the Ensembl IDs from rownames of dge_res
+  column = "GENENAME",            # Retrieve gene descriptions
+  keytype = "ENSEMBL",            # Match based on Ensembl IDs
+  multiVals = "first"             # Use the first match if multiple exist
+)
+
+
+full_res$Symbol <- mapIds(
+  org.Hs.eg.db,
+  keys = full_res$Gene,       # Use the Ensembl IDs from rownames of dge_res
+  column = "SYMBOL",              # Retrieve gene symbols
+  keytype = "ENSEMBL",            # Match based on Ensembl IDs
+  multiVals = "first"             # Use the first match if multiple exist
+)
+
+# Map Ensembl IDs to gene descriptions
+full_res$Description <- mapIds(
+  org.Hs.eg.db,
+  keys = full_res$Gene,       # Use the Ensembl IDs from rownames of dge_res
+  column = "GENENAME",            # Retrieve gene descriptions
+  keytype = "ENSEMBL",            # Match based on Ensembl IDs
+  multiVals = "first"             # Use the first match if multiple exist
+)
+View(dge_res)
+```

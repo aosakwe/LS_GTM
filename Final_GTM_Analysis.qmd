@@ -1,0 +1,409 @@
+---
+title: "LS - SpaTM-G Analysis"
+author: "Adrien Osakwe"
+format: html
+editor: visual
+---
+
+## Load Libraries + Data
+
+```{r,message = F, warning=F}
+set.seed(1234)
+library(scran)
+library(scuttle)
+library(dplyr)
+library(stringr)
+library(Matrix)
+library(ggpubr)
+library(SpaTM)
+
+gtm_phi <- readRDS("./Manuscript/log_filter_raw_final_phi_output.rds")
+```
+
+## Apply to LS
+
+```{r}
+rm_samples <- '/home/adrien/Desktop/LS_GTM/meta/remove_samples.txt'
+meta_df <- '/home/adrien/Desktop/LS_GTM/meta/patient_meta.csv'
+ls_meta <- '/home/adrien/Desktop/LS_GTM/meta/LS_Meta.csv'
+
+meta_df <- read.csv(meta_df,header = T,na.strings = "N/A")
+rownames(meta_df) <- meta_df$Patient
+ls_meta <- read.csv(ls_meta, header = T,na.strings = "N/A")
+
+rm_samples <- colnames(read.csv(rm_samples))
+meta_df <- meta_df[!rownames(meta_df) %in% rm_samples,]
+meta_df$Cond <- NA
+meta_df$Cond[str_detect(rownames(meta_df),"CSU")] <- 'CSU'
+meta_df$Cond[str_detect(rownames(meta_df),"LS")] <- 'LS'
+meta_df$Cond[str_detect(rownames(meta_df),"N")] <- 'CTRL'
+meta_df$Cond[str_detect(rownames(meta_df),"CTRL")] <- 'CTRL'
+rownames(meta_df) <- str_replace(rownames(meta_df),"\\.","-")
+
+meta_df$GCL <- NA
+meta_df$GCL[match(ls_meta$Sample.Name,rownames(meta_df))] <- ls_meta$Subtype..HC..Generalized..Circumscribed..Linear.
+meta_df$GCL[meta_df$Cond == 'CTRL'] <- 'Healthy'
+meta_df$Activity <- NA
+meta_df$Activity[match(ls_meta$Sample.Name,rownames(meta_df))] <- ls_meta$Activity..Healthy..Inactive..Active.
+meta_df$Activity[meta_df$Cond == 'CTRL'] <- 'Healthy'
+meta_df$Group <- NA
+meta_df$Group[match(ls_meta$Sample.Name,rownames(meta_df))] <- ls_meta$Group..Fibrotic.Inflammatory.
+meta_df$Group[meta_df$Cond == 'CTRL'] <- 'Healthy'
+meta_df$Cond[meta_df$Cond == 'CTRL'] <- 'Healthy'
+
+
+meta_df <- meta_df[meta_df$Cond != 'CSU',]
+
+
+
+
+meta_df <- meta_df %>%
+  dplyr::select(-Patient) %>%
+  dplyr::mutate(Cond = factor(Cond,levels = c('Healthy','LS')),
+                Activity = factor(Activity,levels = c('Healthy','Inactive','Active')),
+                Group  = factor(Group,levels = c('Healthy','Inflammatory','I/F','Fibrotic')),
+                GCL = factor(GCL, levels = c('Healthy','Generalized','Circumscribed','Linear')))
+```
+
+```{r}
+#Summarized Experiment
+bulk_counts <- read.csv("./Data/final_counts.csv")
+rownames(bulk_counts) <- bulk_counts$Gene
+bulk_counts <- bulk_counts[,-1]
+bulk_counts <- as.matrix(bulk_counts)
+colnames(bulk_counts) <- str_replace(colnames(bulk_counts),'\\.','-')
+library(Matrix)
+bulk_counts <- as(bulk_counts,'dgCMatrix')
+
+bulk_counts <- bulk_counts[,rownames(meta_df)]
+se <- SingleCellExperiment(assays = list(counts = bulk_counts),
+                           colData = meta_df)
+
+keep.genes <- intersect(rownames(gtm_phi),rownames(se))
+se <- se[keep.genes,]
+gtm_phi <- gtm_phi[keep.genes,]
+```
+
+```{r}
+K <- ncol(gtm_phi)
+se <- SingleCellTopicExperiment(se,K = K)
+
+
+se <- inferTopics(se,6,150,T,gtm_phi)
+
+se <- buildTheta(se)
+
+colnames(theta(se)) <- colnames(gtm_phi)
+
+saveRDS(theta(se),"./Manuscript/DESeq2/LS_decon.rds")
+```
+
+```{r}
+library(reshape2)
+library(ggplot2)
+decon <- cbind(as.data.frame(theta(se)),
+               meta_df)
+cell_names <- colnames(decon)[1:20]
+```
+
+```{r}
+all_data <- list()
+all_data[['Group']]  <- decon %>%  dplyr::select(-GCL, -Age, -Sex, -Cond, -Activity)
+all_data[['Activity']] <- decon %>%  dplyr::select(-GCL, -Age, -Sex, -Cond, -Group)
+all_data[['Cond']]  <- decon %>%  dplyr::select(-GCL, -Age, -Sex, -Activity, -Group)
+all_data[['GCL']]   <- decon %>%  dplyr::select(-Cond, -Age, -Sex, -Activity, -Group)
+# Iterate over unique variables
+unique_vars <-cell_names
+all_plots <- list()
+
+
+ls_compare <- list(
+                  Group = list( c("Healthy", "Inflammatory"),
+                                c("Healthy", "Fibrotic"),
+                                c("Inflammatory", "Fibrotic")),
+                  Activity = list(c('Healthy','Active')),
+                  Cond = list(c('Healthy','LS')),
+                  GCL = list(c('Healthy','Generalized'),
+                             c('Healthy','Circumscribed'),
+                             c('Generalized','Circumscribed')))
+
+
+ls_color <- list(
+  Group  = c("#00AFBB", "#E7B800", "#FC4E07","#C26EFF"),
+  Activity = c("#00AFBB", "#69D045", "#6A0572"),
+  Cond = c("#00AFBB",'#E63946'),
+  GCL = c("#00AFBB",'#D3D3D3','#808080','#404040'))
+
+
+for (id_var in names(all_data)){
+  data <- all_data[[id_var]]
+  data_long <- melt(data, id.vars = id_var) %>% na.omit()
+  cur_plots <- list()
+  for (var in unique_vars){
+    plot_data <- data_long %>%  
+      dplyr::filter(variable == var)
+  
+    cur_plots[[var]] <- ggboxplot(plot_data,
+            x = id_var, y = "value",
+            fill = id_var,
+            palette = ls_color[[id_var]],
+            add = "jitter") + 
+    stat_compare_means(comparisons = ls_compare[[id_var]],
+                       method = "wilcox.test",
+                        p.adjust.method = "BH",
+                       bracket_size = 0.25,
+                         size = 6) +
+      theme_minimal(base_size = 25) +
+        theme(
+          axis.ticks.x = element_blank(),
+          axis.text.x = element_blank(),
+          axis.title.x = element_blank(),  
+          plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+          axis.line = element_line(size = 1),  # Thicker axis lines
+          axis.ticks = element_line(size = 1)
+        ) +
+        labs(
+          #title = str_to_title(var),
+          x = id_var,
+          y = "Proportion"
+        )
+                    
+  }
+  all_plots[[id_var]] <- cur_plots
+}
+```
+
+```{r,echo = FALSE}
+library(patchwork)
+final_plots <- list()
+for (var in unique_vars){
+  final_plots[[var]] <- wrap_plots(all_plots[[3]][[var]],
+                                   all_plots[[1]][[var]] + theme(axis.title.y = element_blank()),
+                                   all_plots[[2]][[var]],
+                                   all_plots[[4]][[var]]+ theme(axis.title.y = element_blank())) +
+  plot_annotation(title = str_to_title(var),
+                  theme = theme(plot.title = element_text(size = 20,
+                                                          face = "bold",
+                                                          hjust = 0.5))) + plot_layout(guides = 'collect')
+
+}
+
+lapply(cell_names,function(a){
+  #png(paste("./Manuscript/CT_Decon/png/",str_replace_all(a," ",''),"_boxplot.png",sep = ''),width = 775,height = 520)
+
+  print(final_plots[[a]])
+  ggsave(paste("./Manuscript/CT_Decon/svg/",str_replace_all(a," ",''),"_boxplot.pdf",sep = ''),width =15,height = 15,device = 'pdf')
+  #dev.off()
+})
+```
+
+```{r}
+# Create a data frame of all statistical test results
+all_test_results <- list()
+
+for (id_var in names(all_data)) {
+  data <- all_data[[id_var]]
+  data_long <- melt(data, id.vars = id_var) %>% na.omit()
+  
+  for (var in unique_vars) {
+    plot_data <- data_long %>%  
+      dplyr::filter(variable == var)
+    
+    # Filter out unwanted levels
+    if (id_var == "Group") {
+      plot_data <- plot_data %>% filter(Group != "I/F")
+    }
+    if (id_var == "GCL") {
+      plot_data <- plot_data %>% filter(GCL != "Linear")
+    }
+    if (id_var == "Activity") {
+      plot_data <- plot_data %>% filter(Activity != "Inactive")
+    }
+    
+    # Create formula for compare_means
+    formula <- as.formula(paste("value ~", id_var))
+    
+    # Run statistical tests
+    test_results <- compare_means(
+      formula = formula,
+      data = plot_data,
+      method = "wilcox.test",
+      p.adjust.method = "BH",
+      comparisons = ls_compare[[id_var]]
+    )
+    
+    # Add metadata
+    test_results$CellType <- var
+    test_results$Factor <- id_var
+    
+    # Add to results list
+    all_test_results[[paste(id_var, var, sep = "_")]] <- test_results
+  }
+}
+
+# Combine all results into one data frame
+final_test_results <- do.call(rbind, all_test_results)
+
+```
+
+```{r}
+# Create a data frame of all statistical test results with group means
+all_test_results <- list()
+
+for (id_var in names(all_data)) {
+  data <- all_data[[id_var]]
+  data_long <- melt(data, id.vars = id_var) %>% na.omit()
+
+  
+  for (var in unique_vars) {
+    plot_data <- data_long %>%  
+      dplyr::filter(variable == var)
+    
+    # Filter out unwanted levels
+    if (id_var == "Group") {
+      plot_data <- plot_data %>% filter(Group != "I/F")
+    }
+    if (id_var == "GCL") {
+      plot_data <- plot_data %>% filter(GCL != "Linear")
+    }
+    if (id_var == "Activity") {
+      plot_data <- plot_data %>% filter(Activity != "Inactive")
+    }
+    
+    # Calculate means for each group
+    group_means <- plot_data %>%
+      group_by(!!sym(id_var)) %>%
+      summarize(mean_value = mean(value, na.rm = TRUE),
+                n = n())
+    
+    # Create formula for compare_means
+    formula <- as.formula(paste("value ~", id_var))
+    
+    # Run statistical tests
+    test_results <- compare_means(
+      formula = formula,
+      data = plot_data,
+      method = "wilcox.test",
+      p.adjust.method = "BH",
+      comparisons = ls_compare[[id_var]]
+    )
+    
+    # Add means to test results
+    test_results <- test_results %>%
+      mutate(
+        group1_mean = sapply(group1, function(g) {
+          group_means$mean_value[group_means[[id_var]] == g]
+        }),
+        group2_mean = sapply(group2, function(g) {
+          group_means$mean_value[group_means[[id_var]] == g]
+        })
+      )
+    
+    # Add metadata
+    test_results$CellType <- var
+    test_results$Factor <- id_var
+    
+    # Add to results list
+    all_test_results[[paste(id_var, var, sep = "_")]] <- test_results
+
+  }
+  
+}
+
+# Combine all results into one data frame
+final_test_results <- do.call(rbind, all_test_results)
+
+```
+
+```{r}
+all_plots <- list()
+
+for (id_var in names(all_data)) {
+  cur_plots <- list()
+  for (var in unique_vars) {
+    # Use the full data for plotting, omitting NA values
+    plot_data <- melt(all_data[[id_var]], id.vars = id_var) %>% 
+      filter(variable == var) %>% na.omit()
+    
+    # For computing annotation positions, use a filtered version (unwanted groups omitted)
+    stat_data <- plot_data
+    if (id_var == "Group") {
+      stat_data <- stat_data %>% filter(Group != "I/F")
+    }
+    if (id_var == "GCL") {
+      stat_data <- stat_data %>% filter(GCL != "Linear")
+    }
+    if (id_var == "Activity") {
+      stat_data <- stat_data %>% filter(Activity != "Inactive")
+    }
+    
+    # Subset the pre-computed test results for this factor and cell type
+    stat_subset <- final_test_results %>% 
+      filter(CellType == var, Factor == id_var)
+    
+    # Set annotation y.position using full (plot_data) values (omit NAs)
+    base_y <- max(plot_data$value, na.rm = TRUE) * 1.05
+    stat_subset <- stat_subset %>%
+      arrange(p.adj) %>%
+      mutate(y.position = base_y + (row_number()-1) * 0.1 * base_y)  # increased vertical space
+    
+    # Create the box plot with jitter and p-value annotations
+    p <- ggboxplot(plot_data,
+                   x = id_var, 
+                   y = "value",
+                   fill = id_var,
+                   palette = ls_color[[id_var]],
+                   add = "jitter") +
+         stat_pvalue_manual(stat_subset,
+                            label = "p.adj",
+                            xmin = "group1",
+                            xmax = "group2",
+                            y.position = "y.position",
+                            tip.length = 0.01,
+                            bracket.size = 0.5,
+                            size = 6,
+                            step.increase = 0.005) +
+         theme_minimal(base_size = 20) +
+         theme(
+           axis.text.x = element_blank(),
+           axis.ticks.x = element_blank(),
+           axis.title.x = element_blank(),
+           plot.title = element_text(hjust = 0.5),
+           axis.line = element_line(size = 1),
+           axis.ticks = element_line(size = 1)
+         ) +
+         labs(
+           #title = str_to_title(var),
+           x = id_var,
+           y = "Proportion"
+         )
+    
+    cur_plots[[var]] <- p
+  }
+  all_plots[[id_var]] <- cur_plots
+}
+```
+
+```{r}
+library(patchwork)
+final_plots <- list()
+for (var in unique_vars){
+  final_plots[[var]] <- wrap_plots(all_plots[[3]][[var]],
+                                   all_plots[[1]][[var]] + theme(axis.title.y = element_blank()),
+                                   all_plots[[2]][[var]],
+                                   all_plots[[4]][[var]]+ theme(axis.title.y = element_blank())) +
+  plot_annotation(title = str_to_title(var),
+                  theme = theme(plot.title = element_text(size = 20,
+                                                          face = "bold",
+                                                          hjust = 0.5))) + plot_layout(guides = 'collect')
+
+}
+
+lapply(cell_names,function(a){
+  #png(paste("./Manuscript/CT_Decon/png/",str_replace_all(a," ",''),"_boxplot.png",sep = ''),width = 775,height = 520)
+
+  print(final_plots[[a]])
+  ggsave(paste("./Manuscript/CT_Decon/svg/",str_replace_all(a," ",''),"_boxplot.pdf",sep = ''),width =15,height = 15,device = 'pdf')
+  #dev.off()
+})
+```

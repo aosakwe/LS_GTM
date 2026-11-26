@@ -1,0 +1,400 @@
+---
+title: "Signature_Analysis"
+author: "Adrien Osakwe"
+format: html
+editor: visual
+---
+
+```{r,message=F,warning=F}
+set.seed(1234)
+library(SpaTM)
+library(scran)
+library(Matrix)
+library(tidyverse)
+library(ggpubr)
+```
+
+## Load Data and Signatures
+
+```{r}
+
+cmat <- read.csv('Data/raw_counts.csv')
+cmat <- cmat[!duplicated(cmat$Symbol),]
+rownames(cmat) <- cmat$Symbol
+cmat <- cmat[,3:ncol(cmat)]
+colnames(cmat) <- str_replace(colnames(cmat),'\\.','-')
+cmat <- as.matrix(cmat)
+
+
+
+
+
+meta_df <- data.frame(row.names = colnames(cmat),
+                      Sample = colnames(cmat),
+                      TotalCounts = colSums(cmat))
+
+
+rm_samples <- './meta/remove_samples.txt'
+age_meta <- './meta/patient_meta.csv'
+ls_meta <- './meta/LS_Meta.csv'
+
+all_samples <- rownames(meta_df)
+age_meta <- read.csv(age_meta,header = T,na.strings = "N/A")
+ls_meta <- read.csv(ls_meta, header = T,na.strings = "N/A")
+
+rm_samples <- colnames(read.csv(rm_samples))
+meta_df <- meta_df[!rownames(meta_df) %in% rm_samples,]
+meta_df$Cond <- NA
+meta_df$Cond[str_detect(rownames(meta_df),"CSU")] <- 'CSU'
+meta_df$Cond[str_detect(rownames(meta_df),"LS")] <- 'LS'
+meta_df$Cond[str_detect(rownames(meta_df),"N")] <- 'CTRL'
+meta_df$Cond[str_detect(rownames(meta_df),"CTRL")] <- 'CTRL'
+rownames(meta_df) <- str_replace(rownames(meta_df),"\\.","-")
+
+meta_df$Age <- age_meta$Age[match(rownames(meta_df),age_meta$Patient)]
+meta_df$Sex <- age_meta$Sex[match(rownames(meta_df),age_meta$Patient)]
+meta_df$GCL <- NA
+meta_df$GCL[match(ls_meta$Sample.Name,rownames(meta_df))] <- ls_meta$Subtype..HC..Generalized..Circumscribed..Linear.
+meta_df$GCL[meta_df$Cond == 'CTRL'] <- 'Healthy'
+meta_df$Activity <- NA
+meta_df$Activity[match(ls_meta$Sample.Name,rownames(meta_df))] <- ls_meta$Activity..Healthy..Inactive..Active.
+meta_df$Activity[meta_df$Cond == 'CTRL'] <- 'Healthy'
+meta_df$Group <- NA
+meta_df$Group[match(ls_meta$Sample.Name,rownames(meta_df))] <- ls_meta$Group..Fibrotic.Inflammatory.
+meta_df$Group[meta_df$Cond == 'CTRL'] <- 'Healthy'
+meta_df$Cond[meta_df$Cond == 'CTRL'] <- 'Healthy'
+
+##Align with cmat
+cmat <- cmat[,rownames(meta_df)]
+table(colnames(cmat) == rownames(meta_df))
+
+
+##Need to create SummarizedTopicExperiment
+imm_se <- SingleCellExperiment(assays = list(counts = cmat))
+colData(imm_se) <- as(meta_df,'DFrame')
+imm_se <- imm_se[,imm_se$Cond != 'CSU']
+library(biomaRt)
+
+# Connect to the Ensembl database
+mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+# Get mitochondrial genes (genes located on the mitochondrial genome)
+mito_genes <- getBM(
+  attributes = c("hgnc_symbol", "ensembl_gene_id", "chromosome_name"),
+  filters = "chromosome_name", 
+  values = "MT", 
+  mart = mart
+)
+
+#Background genes
+bg.genes <- rownames(imm_se)[
+  str_detect(rownames(imm_se),'RPL') |
+  str_detect(rownames(imm_se),'RPS') |
+  rownames(imm_se) %in% mito_genes$hgnc_symbol
+]
+library(readr)
+LS_Unfiltered <- read_csv("Manuscript/DESeq2/LS_Unfiltered.csv")
+bg.genes <- LS_Unfiltered$Symbol[LS_Unfiltered$P.Value > 0.05 & abs(LS_Unfiltered$logFC) < 1]
+backup <- imm_se
+```
+
+```{r}
+#Loading and setting gene signatures
+imm_se <- backup
+imm_sig <- read.csv("./Data/final_imm_signatures.csv")
+imm_sig <- imm_sig %>%
+    dplyr::filter(Source == 'Elvis') %>%
+    dplyr::filter(str_detect(signature,'Th')) %>%
+    dplyr::select(genes,signature) %>%
+    dplyr::distinct()
+
+#imm_sig <- imm_sig[imm_sig$genes %in% rownames(imm_se),]
+
+K <- length(unique(imm_sig$signature)) + 1
+keep.genes <- intersect(rownames(imm_se),c(imm_sig$genes,bg.genes))
+imm_se <- imm_se[keep.genes,]
+imm_sig <- imm_sig[imm_sig$genes %in% keep.genes,]
+bg.genes <- bg.genes[bg.genes %in% keep.genes & !bg.genes %in% imm_sig$genes]
+imm_phi <- matrix(0,nrow = nrow(imm_se),ncol = K)
+
+rownames(imm_phi) <- rownames(imm_se)
+
+imm_sigs <- unique(imm_sig$signature)
+colnames(imm_phi) <- c(imm_sigs,'Background')
+
+for (sig in imm_sigs){
+  cur_genes <- imm_sig$genes[imm_sig$signature == sig]
+  imm_phi[cur_genes,sig] <- 1
+  imm_phi[cur_genes,sig] <- imm_phi[cur_genes,sig]/sum(imm_phi[cur_genes,sig])
+  
+}
+
+#Background topic
+imm_phi[bg.genes,K] <- 1/length(bg.genes)
+#imm_phi[,K] <- 1/nrow(imm_phi)
+table(imm_sig$signature)
+```
+
+## Infer Topics
+
+```{r}
+imm_se <- SingleCellTopicExperiment(imm_se,
+                                K = K)
+imm_se$Group <- factor(imm_se$Group,levels = c('Healthy','Inflammatory','I/F','Fibrotic'))
+imm_se$Activity <- factor(imm_se$Activity,levels = c('Healthy','Inactive','Active'))
+imm_se$Cond <- factor(imm_se$Cond,levels = c('Healthy','LS'))
+imm_se$GCL <- factor(imm_se$GCL, levels = c('Healthy','Generalized','Circumscribed','Linear'))
+
+imm_se <- inferTopics(imm_se,
+                  num_threads = 6,
+                  maxiter = 150,
+                  verbal = T,
+                  phi = imm_phi)
+imm_se <- buildTheta(imm_se)
+```
+
+```{r}
+theta_df <- theta(imm_se)
+colnames(theta_df) <- colnames(imm_phi)
+res_df <- cbind(as.data.frame(colData(imm_se)),
+                theta_df)
+
+library(reshape2)
+res_df <- melt(res_df)
+```
+
+```{r}
+library(ggpubr)
+library(dplyr)
+
+# Assume cur_res is defined as:
+cur_res <- res_df %>%
+  filter(variable %in% colnames(imm_phi))
+
+# Your predefined comparisons and color lists
+ls_compare <- list(
+  Group = list( c("Healthy", "Inflammatory"),
+                c("Healthy", "Fibrotic"),
+                c("Inflammatory", "Fibrotic")),
+  Activity = list(c('Healthy','Active')),
+  Cond = list(c('Healthy','LS')),
+  GCL = list(c('Healthy','Generalized'),
+             c('Healthy','Circumscribed'),
+             c('Generalized','Circumscribed'))
+)
+
+
+ls_color <- list(
+  Group  = c("#00AFBB", "#E7B800", "#FC4E07","#C26EFF"),
+  Activity = c("#00AFBB", "#69D045", "#6A0572"),
+  Cond = c("#00AFBB",'#E63946'),
+  GCL = c("#00AFBB",'#D3D3D3','#808080','#404040'))
+
+all_results <- list()
+
+for (cur_comp in names(ls_compare)) {
+  for (cell in unique(cur_res$variable)) {
+    # Filter the data for this cell/signature
+    cur_res_cell <- cur_res %>% filter(variable == cell)  %>% 
+      dplyr::select(variable,cur_comp,value) %>%
+      na.omit()
+    
+    # Apply filters to remove unwanted levels
+    if (cur_comp == "Group") {
+      cur_res_cell <- cur_res_cell %>% filter(Group != "I/F")
+    }
+    if (cur_comp == "GCL") {
+      cur_res_cell <- cur_res_cell %>% filter(GCL != "Linear")
+    }
+    if (cur_comp == "Activity") {
+      cur_res_cell <- cur_res_cell %>% filter(Activity != "Inactive")
+    }
+    
+    # Calculate means for each group
+    group_means <- cur_res_cell %>%
+      group_by(!!sym(cur_comp)) %>%
+      summarize(mean_value = mean(value, na.rm = TRUE),
+                sd_value = sd(value, na.rm = TRUE),
+                n = n())
+    
+    # Create formula for compare_means
+    fml <- as.formula(paste("value ~", cur_comp))
+    
+    # Run the comparisons using compare_means() from ggpubr
+    test_res <- compare_means(
+      formula = fml,
+      data = cur_res_cell,
+      method = "wilcox.test",
+      p.adjust.method = "BH",
+      comparisons = ls_compare[[cur_comp]]
+    )
+    
+    # Add group means to test results
+    test_res <- test_res %>%
+      mutate(
+        group1_mean = sapply(group1, function(g) {
+          group_means$mean_value[group_means[[cur_comp]] == g]
+        }),
+        group2_mean = sapply(group2, function(g) {
+          group_means$mean_value[group_means[[cur_comp]] == g]
+        })
+      )
+    
+    # Add columns for the current cell and grouping factor
+    test_res <- test_res %>%
+      mutate(variable = cell,
+             comparison_factor = cur_comp)
+    
+    all_results[[paste(cur_comp, cell, sep = "_")]] <- test_res
+  }
+}
+
+# Combine all the results into one data.frame
+final_results <- do.call(rbind, all_results)
+
+```
+
+```{r}
+all_plots <- list()
+for (cur_comp in names(ls_compare)) {
+  cur_plots <- list()
+  for (cell in unique(cur_res$variable)) {
+    # Use the full data for plotting (omit NAs)
+    plot_data <- cur_res %>% 
+      filter(variable == cell) %>% 
+      dplyr::select(variable, !!sym(cur_comp), value) %>%
+      na.omit()
+    
+    # Remove outliers from the data (for jitter and base_y computation)
+    # Here we filter separately for each level of the grouping variable.
+    plot_data_no_out <- plot_data %>%
+      group_by_at(cur_comp) %>%
+      #filter(value <= quantile(value, 0.75) + 1.5 * IQR(value)) %>%
+      ungroup()
+    
+    # For the statistics, create a filtered version (without unwanted levels)
+    stat_data <- plot_data
+    if (cur_comp == "Group") {
+      stat_data <- stat_data %>% filter(Group != "I/F")
+    }
+    if (cur_comp == "GCL") {
+      stat_data <- stat_data %>% filter(GCL != "Linear")
+    }
+    if (cur_comp == "Activity") {
+      stat_data <- stat_data %>% filter(Activity != "Inactive")
+    }
+    
+    # Subset the final_results (computed on filtered data) for the current factor and cell
+    stat_subset <- final_results %>% 
+      filter(variable == cell, comparison_factor == cur_comp)
+    
+    # Compute a base y.position from the outlier-filtered data so that annotations are high enough
+    base_y <- max(plot_data_no_out$value, na.rm = TRUE)
+    base_y <- base_y * ifelse(base_y > 0.9, 1, 1.01)
+    stat_subset <- stat_subset %>%
+      arrange(p.adj) %>%
+      mutate(y.position = base_y + (row_number()-1) * 0.005 * base_y)  # adjust step as needed
+    
+    # Generate the boxplot using the outlier-filtered data
+    p <- ggboxplot(plot_data_no_out,
+                   x = cur_comp, 
+                   y = "value",
+                   fill = cur_comp,
+                   palette = ls_color[[cur_comp]],
+                   add = "jitter",
+                   outlier.shape = NA) +
+      # Annotate using stat_pvalue_manual with a small step.increase
+      stat_pvalue_manual(stat_subset,
+                         label = "p.adj",
+                         xmin = "group1",
+                         xmax = "group2",
+                         y.position = "y.position",
+                         tip.length = 0.01,
+                         bracket.size = 0.5,
+                         size = 6,
+                         step.increase = 0.05) +  
+      theme_minimal(base_size = 20) +
+      theme(
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.x = element_blank(),
+        plot.title = element_text(hjust = 0.5),
+        axis.line = element_line(linewidth = 1),
+        axis.ticks = element_line(linewidth = 1)
+      ) +
+      labs(
+        #title = cell,
+        x = cur_comp,
+        y = "Activity Score"
+      )
+    
+    cur_plots[[cell]] <- p
+  }
+  all_plots[[cur_comp]] <- cur_plots
+}
+```
+
+```{r}
+library(patchwork)
+final_plots <- list()
+for (var in unique(cur_res$variable)){
+  final_plots[[var]] <- wrap_plots(all_plots[[3]][[var]],
+                                   all_plots[[1]][[var]]+ theme(axis.title.y = element_blank()),
+                                   all_plots[[2]][[var]],
+                                   all_plots[[4]][[var]]+ theme(axis.title.y = element_blank())) +
+  plot_annotation(title = paste(var,"Signature"),
+                  theme = theme(plot.title = element_text(size = 20,
+                                                          face = "bold",
+                                                          hjust = 0.425))) + plot_layout(guides = 'collect')
+
+}
+
+
+
+for ( a in unique(cur_res$variable)){
+  #png(paste("./Manuscript/ImmSig/png/",str_replace_all(a," ",''),"_boxplot.png",sep = ''),width = 775,height = 520)
+  print(final_plots[[a]])
+   ggsave(paste("./Manuscript/ImmSig/svg/",str_replace_all(a," ",''),"_boxplot.pdf",sep = ''),width =15,height = 15,device = 'pdf')
+  #dev.off()
+}
+```
+
+## Clinical Features
+
+```{r}
+theta_df <- as.data.frame(theta_df)
+clin_df <- read.csv("./Data/Final_Iteration/LS_ClinicalData.csv",header = T)
+clin_df  <- clin_df %>%
+  filter(Event.Name == 'Landing form')
+clin_df$Duration <- clin_df$Age.at.diagnosis..in.years. - clin_df$Age.of.appearance.of.lesion..in.years.
+clin_df$Group <- clin_df$Group..Fibrotic.Inflammatory.
+clin_df$Subtype <- clin_df$Subtype..HC..Generalized..Circumscribed..Linear.
+clin_df$Activity <- clin_df$Activity..Healthy..Inactive..Active.
+clin_df <- melt(clin_df)
+
+library(reshape2)
+
+table(clin_df$SAMPLE == rownames(theta(imm_se))[match(clin_df$SAMPLE,rownames(theta_df))])
+clin_df$Th1 <- theta_df[match(clin_df$SAMPLE,rownames(theta_df)),]$Th1
+clin_df$Th2 <- theta_df[match(clin_df$SAMPLE,rownames(theta_df)),]$Th2
+clin_df$Th17 <- theta_df[match(clin_df$SAMPLE,rownames(theta_df)),]$Th17
+
+
+ggplot(clin_df,aes(x = value, y = Th1,color = Group)) +
+  geom_point() +
+  facet_wrap(~ variable,scales = "free_x")
+
+clin_df %>%
+  dplyr::filter(variable == 'Duration') %>%
+  ggplot(aes(x = value, y = log10(Th1),color = Group)) +
+    geom_point(size = 5) +
+    facet_wrap(~ variable,scales = "free_x") +
+    labs(x = 'Time until Diagnosis (Years)') +
+    theme_minimal(base_size = 20) +
+    theme(
+        plot.title = element_text(hjust =  0.5),
+        axis.line = element_line(linewidth = 1),  # Thicker axis lines
+        axis.ticks = element_line(linewidth = 1)
+      )
+
+```

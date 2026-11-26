@@ -1,0 +1,104 @@
+---
+title: "CTS_Deconvolution"
+author: "Adrien Osakwe"
+format: html
+editor: visual
+---
+
+## Load Library
+
+```{r,message = F, warning=F}
+set.seed(1234)
+library(scran)
+library(scuttle)
+library(dplyr)
+library(stringr)
+library(Matrix)
+library(SpaTM)
+
+gtm_phi <- readRDS("./Manuscript/log_filter_raw_final_phi_output.rds")
+```
+
+```{r}
+rm_samples <- '/home/adrien/Desktop/LS_GTM/meta/remove_samples.txt'
+meta_df <- '/home/adrien/Desktop/LS_GTM/meta/patient_meta.csv'
+ls_meta <- '/home/adrien/Desktop/LS_GTM/meta/LS_Meta.csv'
+
+meta_df <- read.csv(meta_df,header = T,na.strings = "N/A")
+rownames(meta_df) <- meta_df$Patient
+ls_meta <- read.csv(ls_meta, header = T,na.strings = "N/A")
+
+rm_samples <- colnames(read.csv(rm_samples))
+meta_df <- meta_df[!rownames(meta_df) %in% rm_samples,]
+meta_df$Cond <- NA
+meta_df$Cond[str_detect(rownames(meta_df),"CSU")] <- 'CSU'
+meta_df$Cond[str_detect(rownames(meta_df),"LS")] <- 'LS'
+meta_df$Cond[str_detect(rownames(meta_df),"N")] <- 'CTRL'
+meta_df$Cond[str_detect(rownames(meta_df),"CTRL")] <- 'CTRL'
+rownames(meta_df) <- str_replace(rownames(meta_df),"\\.","-")
+
+meta_df$GCL <- NA
+meta_df$GCL[match(ls_meta$Sample.Name,rownames(meta_df))] <- ls_meta$Subtype..HC..Generalized..Circumscribed..Linear.
+meta_df$GCL[meta_df$Cond == 'CTRL'] <- 'Healthy'
+meta_df$Activity <- NA
+meta_df$Activity[match(ls_meta$Sample.Name,rownames(meta_df))] <- ls_meta$Activity..Healthy..Inactive..Active.
+meta_df$Activity[meta_df$Cond == 'CTRL'] <- 'Healthy'
+meta_df$Group <- NA
+meta_df$Group[match(ls_meta$Sample.Name,rownames(meta_df))] <- ls_meta$Group..Fibrotic.Inflammatory.
+meta_df$Group[meta_df$Cond == 'CTRL'] <- 'Healthy'
+meta_df$Cond[meta_df$Cond == 'CTRL'] <- 'Healthy'
+
+
+meta_df <- meta_df[meta_df$Cond != 'CSU',]
+
+meta_df <- meta_df %>%
+  dplyr::select(-Patient)
+
+
+#Summarized Experiment
+bulk_counts <- read.csv("./Data/final_counts.csv")
+rownames(bulk_counts) <- bulk_counts$Gene
+bulk_counts <- bulk_counts[,-1]
+bulk_counts <- as.matrix(bulk_counts)
+colnames(bulk_counts) <- str_replace(colnames(bulk_counts),'\\.','-')
+library(Matrix)
+bulk_counts <- as(bulk_counts,'dgCMatrix')
+
+bulk_counts <- bulk_counts[,rownames(meta_df)]
+se <- SingleCellExperiment(assays = list(counts = bulk_counts),
+                           colData = meta_df)
+
+keep.genes <- intersect(rownames(gtm_phi),rownames(se))
+se <- se[keep.genes,]
+gtm_phi <- gtm_phi[keep.genes,]
+```
+
+```{r}
+
+##Infer
+K <- ncol(gtm_phi)
+se <- SingleCellTopicExperiment(se,K = K)
+
+se_cts <- inferGEx(se,
+                  num_threads = 6,
+                  maxiter = 150,
+                  verbal = TRUE,
+                  phi = gtm_phi)
+
+cts_out <- Matrix(0,nrow(se),K*ncol(se))
+rownames(cts_out) <- rownames(se)
+colnames(cts_out) <- unlist(lapply(colnames(se), function(sample) {
+  paste(sample, colnames(gtm_phi), sep = "_")
+}))
+
+for (i in 1:ncol(se)){
+  cur_gamma <- se_cts[[i]][[1]]
+  cur_mtx <- se_cts[[i]][[2]]
+  cur_sample <- colnames(se)[i]
+  cur_cols <- which(str_detect(colnames(cts_out),cur_sample))
+  cur_genes <- cur_mtx[,3]
+  cts_out[cur_genes,cur_cols] <- sweep(cur_gamma, 1, cur_mtx[,1], "*")
+}
+
+saveRDS(cts_out,"./Manuscript/DESeq2/final_gex.rds")
+```
